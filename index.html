@@ -1446,250 +1446,272 @@
             }
             
             try {
+                console.log(`检查姓名是否存在: "${name}"`);
+                
                 // 获取数据文件内容
                 const apiUrl = `https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO}/contents/${DATA_FILE}`;
                 const response = await fetch(apiUrl, {
                     headers: {
                         'Authorization': `token ${apiKey}`,
-                        'Accept': 'application/vnd.github.v3.raw'
+                        'Accept': 'application/vnd.github.v3.raw'  // 注意：使用 raw 格式获取原始内容
                     }
                 });
                 
+                console.log("检查文件状态:", response.status);
+                
                 if (response.status === 404) {
                     // 文件不存在，表示键也不存在
+                    console.log("文件不存在，姓名可用");
                     return false;
                 }
                 
                 if (!response.ok) {
-                    throw new Error(`获取数据文件失败: ${response.status}`);
+                    const errorText = await response.text();
+                    console.error("获取数据文件失败:", response.status, errorText);
+                    throw new Error(`获取数据文件失败: ${response.status} ${response.statusText}`);
                 }
                 
-                // 获取文件内容
+                // 获取文件内容（GitHub API raw格式直接返回文本）
                 const content = await response.text();
+                console.log("文件内容长度:", content.length);
                 
-                // 解析内容，检查是否存在指定键
-                // 格式示例：[键 : "姓名" ; 值 : "小三"]
+                if (!content || content.trim() === '') {
+                    console.log("文件为空，姓名可用");
+                    return false;
+                }
+                
+                // 解析内容，检查是否存在指定姓名
+                // 格式示例：[键 : "姓名" ; 值 : "小三"][键 : "邮箱" ; 值 : "xxx@xx.com"]...
                 const lines = content.split('\n').filter(line => line.trim());
                 
+                console.log(`文件共有 ${lines.length} 行记录`);
+                
                 for (const line of lines) {
-                    // 使用正则表达式匹配键值对
-                    const keyValuePairs = line.match(/\[键 : "([^"]+)" ; 值 : "([^"]+)"\]/g);
+                    // 使用正则表达式匹配每行中的所有键值对
+                    // 每行可能有多个 [键 : "xxx" ; 值 : "yyy"] 组
+                    const matches = line.matchAll(/\[键 : "([^"]+)" ; 值 : "([^"]+)"\]/g);
                     
-                    if (keyValuePairs) {
-                        for (const pair of keyValuePairs) {
-                            const match = pair.match(/\[键 : "([^"]+)" ; 值 : "([^"]+)"\]/);
-                            if (match && match[1] === "姓名" && match[2] === name) {
-                                return true; // 找到相同姓名的记录
-                            }
+                    let currentName = null;
+                    
+                    for (const match of matches) {
+                        const key = match[1];
+                        const value = match[2];
+                        
+                        // 如果是"姓名"键，保存当前记录的姓名
+                        if (key === "姓名") {
+                            currentName = value;
+                        }
+                        
+                        // 如果找到姓名匹配，返回true
+                        if (currentName === name) {
+                            console.log(`找到重复姓名: "${name}"`);
+                            return true;
                         }
                     }
                 }
                 
+                console.log(`姓名 "${name}" 可用`);
                 return false; // 未找到相同姓名的记录
+                
             } catch (error) {
                 console.error("检查键是否存在时出错:", error);
-                throw error;
+                
+                // 如果是网络错误或权限错误，重新抛出
+                if (error.message.includes('401') || error.message.includes('403') || 
+                    error.message.includes('Failed to fetch')) {
+                    throw error;
+                }
+                
+                // 对于解析错误等，默认返回false（允许提交）
+                console.warn("解析文件时出错，默认允许提交");
+                return false;
             }
         }
         
         
-        // 向数据文件添加新记录
+        // 向数据文件添加新记录 - 重构稳定版
         async function addDataToFile(name, email, message) {
             const apiKey = decodeApiKey();
             if (!apiKey) {
                 throw new Error("API Key解码失败");
             }
             
+            const apiUrl = `https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO}/contents/${DATA_FILE}`;
+            
+            console.log(`=== 开始提交反馈：${name} ===`);
+            
             try {
-                // 首先获取文件的SHA（如果文件存在）
+                // ====== 第一步：获取文件当前状态（稳健获取 sha 和内容）====== 
                 let sha = null;
                 let existingContent = "";
-                let fileExists = false;
                 
+                // 1. 首先，尝试最可靠的 raw 请求获取文件内容
                 try {
-                    const apiUrl = `https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO}/contents/${DATA_FILE}`;
-                    
-                    console.log("发送请求到:", apiUrl);
-                    const response = await fetch(apiUrl, {
+                    console.log("[1] 尝试通过 raw 接口获取文件内容...");
+                    const rawResponse = await fetch(apiUrl, {
                         headers: {
                             'Authorization': `token ${apiKey}`,
-                            'Accept': 'application/vnd.github.v3+json'
+                            'Accept': 'application/vnd.github.v3.raw'
                         }
                     });
                     
-                    console.log("检查文件状态:", response.status, response.statusText);
-                    
-                    if (response.status === 200) {
-                        // 安全地解析 JSON 响应
-                        const responseText = await response.text();
-                        console.log("响应文本长度:", responseText.length);
+                    if (rawResponse.ok) {
+                        existingContent = await rawResponse.text();
+                        console.log(`   ✓ 成功获取内容，长度: ${existingContent.length} 字符`);
                         
-                        if (!responseText || responseText.trim() === '') {
-                            throw new Error("收到空的响应体");
-                        }
-                        
-                        try {
-                            const data = JSON.parse(responseText);
-                            sha = data.sha;
-                            existingContent = atob(data.content);
-                            fileExists = true;
-                            console.log("文件存在，sha:", sha.substring(0, 20) + "...");
-                        } catch (parseError) {
-                            console.error("JSON解析错误:", parseError);
-                            console.error("响应内容:", responseText.substring(0, 200));
-                            throw new Error(`无法解析GitHub API响应: ${parseError.message}`);
-                        }
-                    } else if (response.status === 404) {
-                        // 文件不存在，这是正常的（首次创建）
-                        fileExists = false;
-                        console.log("文件不存在，将创建新文件");
-                    } else {
-                        // 其他错误 - 尝试安全地获取错误信息
-                        const responseText = await response.text();
-                        let errorMessage = `获取文件信息失败: ${response.status} ${response.statusText}`;
-                        
-                        if (responseText && responseText.trim() !== '') {
-                            try {
-                                const errorData = JSON.parse(responseText);
-                                errorMessage += ` - ${errorData.message || '未知错误'}`;
-                            } catch (e) {
-                                errorMessage += ` - 响应: ${responseText.substring(0, 100)}`;
+                        // 2. 成功获取内容后，再专门获取 sha (JSON接口)
+                        console.log("[2] 获取文件 SHA...");
+                        const jsonResponse = await fetch(apiUrl, {
+                            headers: {
+                                'Authorization': `token ${apiKey}`,
+                                'Accept': 'application/vnd.github.v3+json'
                             }
-                        }
+                        });
                         
-                        throw new Error(errorMessage);
+                        if (jsonResponse.ok) {
+                            const responseText = await jsonResponse.text();
+                            if (responseText && responseText.trim() !== '') {
+                                try {
+                                    const data = JSON.parse(responseText);
+                                    if (data && data.sha) {
+                                        sha = data.sha;
+                                        console.log(`   ✓ 获取 SHA 成功: ${sha.substring(0, 15)}...`);
+                                    } else {
+                                        console.warn("   ! JSON 响应中未找到 sha 字段");
+                                    }
+                                } catch (parseErr) {
+                                    console.warn("   ! 解析 SHA 响应失败，将尝试无 SHA 更新:", parseErr.message);
+                                }
+                            }
+                        } else if (jsonResponse.status === 404) {
+                            console.log("   ! JSON 接口返回 404，但 raw 接口成功，可能是缓存或权限问题。继续处理...");
+                        } else {
+                            console.warn(`   ! 获取 SHA 失败 (状态: ${jsonResponse.status})，将尝试无 SHA 更新`);
+                        }
+                    } else if (rawResponse.status === 404) {
+                        console.log("   ✓ 文件不存在（这是首次创建）");
+                        // 文件不存在，sha 为 null，existingContent 为空
+                    } else {
+                        // raw 请求失败且不是 404
+                        const errorText = await rawResponse.text().catch(() => '');
+                        throw new Error(`获取文件失败 (RAW): ${rawResponse.status} - ${errorText.substring(0, 100)}`);
                     }
-                } catch (error) {
-                    console.error("获取文件信息时出错:", error);
-                    throw error;
+                } catch (step1Error) {
+                    console.error("第一步（获取文件状态）出错:", step1Error.message);
+                    // 不立即抛出，尝试继续进行（可能文件不存在）
                 }
                 
-                // 创建新记录
+                // ====== 第二步：构建新内容 ====== 
+                console.log("[3] 构建新记录...");
                 const timestamp = new Date().toISOString();
+                // 转义引号和换行符，确保格式正确
                 const escapedMessage = message.replace(/"/g, '\\"').replace(/\n/g, '\\n');
-                
-                // 格式：每行一个完整的键值对组
                 const newRecord = `[键 : "姓名" ; 值 : "${name}"][键 : "邮箱" ; 值 : "${email}"][键 : "留言" ; 值 : "${escapedMessage}"][键 : "时间" ; 值 : "${timestamp}"]`;
                 
-                // 构建新内容（在现有内容后添加新行）
-                let newContent = existingContent;
+                // 组装完整内容
+                let newContent = existingContent || "";
                 if (newContent && !newContent.endsWith('\n')) {
                     newContent += '\n';
                 }
                 newContent += newRecord;
                 
-                console.log("准备写入，内容长度:", newContent.length);
+                console.log(`   新内容总长度: ${newContent.length} 字符`);
                 
-                // 编码内容为Base64
+                // ====== 第三步：Base64 编码 ====== 
+                console.log("[4] Base64 编码内容...");
                 let base64Content;
                 try {
-                    // 使用更安全的UTF-8编码方式
+                    // 处理中文字符的可靠编码方式
                     base64Content = btoa(unescape(encodeURIComponent(newContent)));
-                } catch (e) {
-                    console.error("Base64编码错误:", e);
+                } catch (encodeError) {
+                    console.error("编码失败，使用备用方案:", encodeError);
                     base64Content = btoa(newContent);
                 }
                 
-                // 准备请求体
+                // ====== 第四步：准备并发送更新请求 ====== 
+                console.log("[5] 准备提交到 GitHub...");
                 const requestBody = {
-                    message: `添加反馈记录: ${name} - ${new Date().toLocaleString()}`,
+                    message: `网站反馈: ${name} (${new Date().toLocaleDateString()})`,
                     content: base64Content
                 };
                 
-                // 只有在文件已存在时才添加sha参数
-                if (fileExists && sha) {
+                // 只有确定有 sha 时才添加，否则让 GitHub 决定是创建还是更新
+                if (sha) {
                     requestBody.sha = sha;
-                    console.log("使用sha参数更新文件，sha:", sha.substring(0, 20) + "...");
+                    console.log(`   使用 SHA: ${sha.substring(0, 15)}...`);
                 } else {
-                    console.log("创建新文件（无sha参数）");
+                    console.log("   未提供 SHA，GitHub 将自动处理（创建或更新）");
                 }
                 
-                // 更新文件
-                const updateUrl = `https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO}/contents/${DATA_FILE}`;
-                console.log("发送更新请求到:", updateUrl);
-                
-                const updateResponse = await fetch(updateUrl, {
+                const updateResponse = await fetch(apiUrl, {
                     method: 'PUT',
                     headers: {
                         'Authorization': `token ${apiKey}`,
                         'Content-Type': 'application/json',
-                        'Accept': 'application/vnd.github.v3+json'
+                        'Accept': 'application/vnd.github.v3+json',
+                        'User-Agent': 'Awnidnrdooiwds-Personal-Site/1.0'
                     },
                     body: JSON.stringify(requestBody)
                 });
                 
-                console.log("更新响应状态:", updateResponse.status, updateResponse.statusText);
+                console.log(`[6] GitHub 响应状态: ${updateResponse.status} ${updateResponse.statusText}`);
                 
-                if (!updateResponse.ok) {
-                    // 安全地获取错误信息
-                    let responseText = '';
+                // ====== 第五步：处理响应 ====== 
+                if (updateResponse.ok) {
+                    console.log("   ✅ 提交成功！");
                     try {
-                        responseText = await updateResponse.text();
-                        console.log("错误响应文本:", responseText.substring(0, 200));
-                    } catch (textError) {
-                        console.error("无法读取响应文本:", textError);
-                    }
-                    
-                    let errorDetail = `状态码: ${updateResponse.status} ${updateResponse.statusText}`;
-                    
-                    if (responseText && responseText.trim() !== '') {
-                        try {
-                            const errorData = JSON.parse(responseText);
-                            if (errorData.message) {
-                                errorDetail += ` - ${errorData.message}`;
-                            }
-                            if (errorData.errors) {
-                                errorDetail += ` - 错误详情: ${JSON.stringify(errorData.errors)}`;
-                            }
-                        } catch (parseError) {
-                            errorDetail += ` - 响应内容: ${responseText.substring(0, 100)}`;
+                        const resultText = await updateResponse.text();
+                        if (resultText) {
+                            const result = JSON.parse(resultText);
+                            console.log(`   提交 SHA: ${result.commit?.sha?.substring(0, 15)}...`);
                         }
+                    } catch (e) {
+                        // 即使解析响应失败，只要状态码是成功的，就认为操作成功
+                        console.log("   ✅ 提交成功（响应解析略过）");
+                    }
+                    return true;
+                } else {
+                    // 处理错误响应
+                    let errorMessage = `GitHub 返回错误: ${updateResponse.status}`;
+                    let errorDetails = '';
+                    
+                    try {
+                        const errorText = await updateResponse.text();
+                        if (errorText) {
+                            errorDetails = errorText.substring(0, 200);
+                            try {
+                                const errorJson = JSON.parse(errorText);
+                                if (errorJson.message) {
+                                    errorMessage += ` - ${errorJson.message}`;
+                                }
+                            } catch (e) {
+                                errorMessage += ` - ${errorDetails}`;
+                            }
+                        }
+                    } catch (textError) {
+                        errorMessage += ` (无法读取错误详情)`;
                     }
                     
-                    throw new Error(`更新数据文件失败: ${errorDetail}`);
-                }
-                
-                // 安全地解析成功响应
-                const responseText = await updateResponse.text();
-                if (!responseText || responseText.trim() === '') {
-                    console.warn("警告: 收到空的成功响应");
-                    return true;
-                }
-                
-                try {
-                    const result = JSON.parse(responseText);
-                    console.log("文件更新成功！提交SHA:", result.commit?.sha?.substring(0, 20) + "..." || "未知");
-                    return true;
-                } catch (parseError) {
-                    console.error("成功响应JSON解析错误:", parseError);
-                    console.log("响应内容:", responseText.substring(0, 200));
-                    // 即使解析失败，如果状态码是200，也算成功
-                    if (updateResponse.status >= 200 && updateResponse.status < 300) {
-                        console.log("状态码表示成功，继续处理");
-                        return true;
+                    // 根据常见状态码提供友好提示
+                    if (updateResponse.status === 422) {
+                        if (errorMessage.includes('sha') || errorMessage.includes('SHA')) {
+                            errorMessage = '提交冲突：文件可能已被其他操作修改。请刷新页面后重试。';
+                        } else {
+                            errorMessage = '数据验证失败，请检查输入内容后重试。';
+                        }
+                    } else if (updateResponse.status === 409) {
+                        errorMessage = '提交冲突：文件正在被其他进程修改，请稍后重试。';
+                    } else if (updateResponse.status === 403) {
+                        errorMessage = '权限不足：Token 可能已过期或无权写入。';
                     }
-                    throw new Error(`无法解析成功响应: ${parseError.message}`);
+                    
+                    throw new Error(errorMessage);
                 }
                 
             } catch (error) {
-                console.error("添加数据到文件时出错:", error);
-                
-                // 提供更友好的错误信息
-                let userMessage = error.message;
-                
-                if (error.message.includes('Unexpected end of JSON input')) {
-                    userMessage = '提交失败：服务器返回了无效的响应。可能是网络问题或GitHub API暂时不可用，请稍后重试。';
-                } else if (error.message.includes('Failed to fetch')) {
-                    userMessage = '提交失败：网络连接错误。请检查网络连接后重试。';
-                } else if (error.message.includes('401') || error.message.includes('403')) {
-                    userMessage = '提交失败：权限不足或Token无效。请确保Token有正确权限且未过期。';
-                } else if (error.message.includes('422')) {
-                    userMessage = '提交失败：数据验证错误。可能是文件已被其他人修改，请刷新页面后重试。';
-                } else if (error.message.includes('404')) {
-                    userMessage = '提交失败：仓库或文件不存在。请检查仓库设置。';
-                }
-                
-                throw new Error(userMessage);
+                console.error("❌ 提交过程出错:", error);
+                // 重新抛出错误，由上层统一处理
+                throw error;
             }
         }
         
